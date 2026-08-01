@@ -150,8 +150,22 @@ class SkewPipeline:
                 adapter = data_adapters.get(item.source_id)
                 if adapter:
                     fetched.update(adapter(fetch_result))
-                # without an adapter, fetch_result is retrieved but not
-                # automatically wired into a test — see class docstring
+                elif (
+                    classification.claim_type == ClaimType.TREND
+                    and item.source_id == "ons"
+                    and "linear_regression" not in fetched
+                ):
+                    # TREND claims (inflation/GDP/wages/etc.) are a single
+                    # ONS time series checked against time itself — we know
+                    # the expected observation shape (see
+                    # ons_connector.parse_timeseries_observations), so wire
+                    # this automatically rather than requiring the caller
+                    # to supply a custom adapter for every trend pattern.
+                    from registry.ons_connector import parse_timeseries_observations
+                    time_index, values = parse_timeseries_observations(fetch_result)
+                    fetched["linear_regression"] = {"x": time_index, "y": values}
+                # otherwise fetch_result is retrieved but not automatically
+                # wired into a test — see class docstring
             test_data = fetched
 
         # --- run recommended tests --------------------------------------

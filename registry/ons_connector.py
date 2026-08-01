@@ -19,11 +19,62 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+import pandas as pd
 import requests
 
 from .base import Connector, FetchResult, Source, SourceType
 
 ONS_API_BASE = "https://api.beta.ons.gov.uk/v1"
+
+
+def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series, pd.Series]:
+    """
+    Convert a raw ONS /observations payload into (time_index, values) series,
+    ready to feed into stat_tests.run_linear_regression(x=time_index, y=values)
+    for a trend claim ("X has risen/fallen since...").
+
+    Built directly against ONS's documented observations response shape:
+        {"observations": [{"observation": "3.2", "dimensions": {"time": {"id": "2024-01", ...}, ...}}, ...]}
+
+    NOT yet live-tested (same caveat as the rest of this connector — this
+    sandbox can't reach api.beta.ons.gov.uk). If ONS's actual response
+    shape differs in some field name, this is the first place to check
+    when a TREND claim fails after the dataset ID itself resolves fine.
+    """
+    observations = fetch_result.data.get("observations", [])
+    if not observations:
+        raise ValueError(
+            "No 'observations' in ONS response — check the dataset's actual "
+            "dimension names via get_dataset_metadata() before assuming this "
+            "adapter's field names are wrong."
+        )
+
+    rows = []
+    for obs in observations:
+        try:
+            value = float(obs["observation"])
+        except (KeyError, ValueError, TypeError):
+            continue  # skip missing/non-numeric observations rather than crash the whole series
+        time_dim = obs.get("dimensions", {}).get("time", {})
+        time_label = time_dim.get("id") or time_dim.get("label")
+        if time_label is None:
+            continue
+        rows.append((time_label, value))
+
+    if len(rows) < 3:
+        raise ValueError(
+            f"Only {len(rows)} usable observations parsed — not enough for a "
+            "trend test. Check the fetch's geography/time filters."
+        )
+
+    # Sort by the time label as given (ONS time IDs are lexically sortable
+    # for both YYYY and YYYY-MM formats) and use position as the numeric
+    # x-axis — the actual calendar spacing doesn't matter for a trend
+    # direction test, only the ordering does.
+    rows.sort(key=lambda r: r[0])
+    time_index = pd.Series(range(len(rows)))
+    values = pd.Series([v for _, v in rows])
+    return time_index, values
 
 
 class ONSConnector(Connector):
@@ -73,7 +124,7 @@ class ONSConnector(Connector):
 
         Example (unemployment claim):
             connector.fetch(
-                dataset_id="unemployment-rate",
+                dataset_id="labour-market",
                 geography="K02000001",   # UK
                 time="*",                # wildcard: all time periods
             )
