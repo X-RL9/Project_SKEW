@@ -59,7 +59,18 @@ def _employment_fetch_plan(claim_text: str) -> list[FetchPlanItem]:
     return [
         FetchPlanItem(
             source_id="ons",
-            params={"dataset_id": "labour-market", "geography": "K02000001", "time": "*"},
+            params={
+                "dataset_id": "labour-market",
+                "geography": "K02000001",
+                "time": "*",
+                "preferred_options": {
+                    "seasonaladjustment": ["Seasonally Adjusted"],
+                    "economicactivity": ["Unemployed"],
+                    "unitofmeasure": ["Rates"],
+                    "sex": ["All adults"],
+                    "agegroups": ["16+"],
+                },
+            },
             purpose="outcome variable: unemployment/employment rate over time",
         ),
         FetchPlanItem(
