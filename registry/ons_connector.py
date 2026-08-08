@@ -17,6 +17,8 @@ the live API once you deploy this somewhere with open egress.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
+import re
 from typing import Optional
 
 import pandas as pd
@@ -25,6 +27,50 @@ import requests
 from .base import Connector, FetchResult, Source, SourceType
 
 ONS_API_BASE = "https://api.beta.ons.gov.uk/v1"
+
+
+class ONSDataError(RuntimeError):
+    """A data-selection or response-shape error from the ONS connector."""
+
+
+def _response_error(resp: requests.Response, context: str) -> ONSDataError:
+    body = (resp.text or "").strip().replace("\n", " ")[:500]
+    detail = f" Response: {body}" if body else ""
+    return ONSDataError(
+        f"ONS {context} failed with HTTP {resp.status_code} for {resp.url}.{detail}"
+    )
+
+
+def _time_value(dimensions: dict) -> Optional[str]:
+    for name, value in dimensions.items():
+        if name.casefold() == "time" and isinstance(value, dict):
+            return value.get("id") or value.get("label")
+    return None
+
+
+def _parse_ons_time(label: str) -> pd.Timestamp:
+    """Parse common ONS labels without treating 1999 as 2099."""
+    text = str(label).strip()
+    monthly = re.fullmatch(r"([A-Za-z]{3})-(\d{2})", text)
+    if monthly:
+        short_year = int(monthly.group(2))
+        current_short_year = datetime.now().year % 100
+        century = 2000 if short_year <= current_short_year + 1 else 1900
+        return pd.Timestamp(datetime.strptime(monthly.group(1), "%b").replace(
+            year=century + short_year
+        ))
+
+    rolling = re.fullmatch(r"([A-Za-z]{3})-[A-Za-z]{3}\s+(\d{4})", text)
+    if rolling:
+        return pd.Timestamp(datetime.strptime(
+            f"{rolling.group(1)} {rolling.group(2)}", "%b %Y"
+        ))
+
+    quarter = re.fullmatch(r"Q([1-4])\s+(\d{4})", text, re.IGNORECASE)
+    if quarter:
+        return pd.Timestamp(year=int(quarter.group(2)), month=3 * int(quarter.group(1)), day=1)
+
+    return pd.to_datetime(text, errors="coerce")
 
 
 def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series, pd.Series]:
@@ -55,8 +101,7 @@ def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series,
             value = float(obs["observation"])
         except (KeyError, ValueError, TypeError):
             continue  # skip missing/non-numeric observations rather than crash the whole series
-        time_dim = obs.get("dimensions", {}).get("time", {})
-        time_label = time_dim.get("id") or time_dim.get("label")
+        time_label = _time_value(obs.get("dimensions", {}))
         if time_label is None:
             continue
         rows.append((time_label, value))
@@ -71,7 +116,11 @@ def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series,
     # for both YYYY and YYYY-MM formats) and use position as the numeric
     # x-axis — the actual calendar spacing doesn't matter for a trend
     # direction test, only the ordering does.
-    rows.sort(key=lambda r: r[0])
+    def sort_key(row):
+        parsed = _parse_ons_time(row[0])
+        return (1, str(row[0])) if pd.isna(parsed) else (0, parsed)
+
+    rows.sort(key=sort_key)
     time_index = pd.Series(range(len(rows)))
     values = pd.Series([v for _, v in rows])
     return time_index, values
@@ -101,17 +150,22 @@ class ONSConnector(Connector):
         )
         super().__init__(source)
 
+    @lru_cache(maxsize=1)
     def list_datasets(self) -> list[dict]:
         """List all datasets available via the ONS API."""
         resp = requests.get(f"{ONS_API_BASE}/datasets", timeout=15)
-        resp.raise_for_status()
+        if not resp.ok:
+            raise _response_error(resp, "dataset catalogue request")
         return resp.json().get("items", [])
 
+    @lru_cache(maxsize=64)
     def get_dataset_metadata(self, dataset_id: str) -> dict:
         resp = requests.get(f"{ONS_API_BASE}/datasets/{dataset_id}", timeout=15)
-        resp.raise_for_status()
+        if not resp.ok:
+            raise _response_error(resp, f"metadata request for '{dataset_id}'")
         return resp.json()
 
+    @lru_cache(maxsize=128)
     def get_dataset_dimensions(self, dataset_id: str, edition: str, version: int) -> list[dict]:
         """List the actual dimensions a dataset/edition/version requires.
         This is how we find out, e.g., that 'labour-market' needs age
@@ -122,9 +176,11 @@ class ONSConnector(Connector):
             f"/versions/{version}/dimensions",
             timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise _response_error(resp, f"dimension request for '{dataset_id}'")
         return resp.json().get("items", [])
 
+    @lru_cache(maxsize=512)
     def get_dimension_options(
         self, dataset_id: str, edition: str, version: int, dimension_id: str, limit: int = 200
     ) -> list[dict]:
@@ -134,7 +190,8 @@ class ONSConnector(Connector):
             params={"limit": limit},
             timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise _response_error(resp, f"option request for '{dataset_id}/{dimension_id}'")
         return resp.json().get("items", [])
 
     def _resolve_edition_version(self, dataset_id: str, edition, version):
@@ -181,83 +238,88 @@ class ONSConnector(Connector):
         `dimension_filters` are passed straight through as query params for
         anything you already know the exact value for. For anything you
         DON'T specify, this method looks up the dataset's real dimensions
-        from ONS (get_dataset_dimensions) and fills in a default for each
-        missing one -- required, because some datasets (labour-market,
-        cpih01, etc.) 400 if every dimension isn't given a value, and the
-        set of dimensions differs per dataset so it can't be hardcoded.
+        from ONS (get_dataset_dimensions). Every required dimension must
+        either be supplied explicitly or have a verified preference. ONS
+        returns HTTP 400 when dimensions are missing.
 
         `preferred_options` lets you bias that auto-fill: for a given
-        dimension id, give an ordered list of label substrings to look for
-        (case-insensitive) among its real options, e.g. prefer "Seasonally
-        Adjusted" over "Not Seasonally Adjusted" for headline unemployment.
-        If nothing matches (or no preference given), it falls back to
-        whatever option ONS lists first -- and that fallback is recorded in
-        the result's notes, not hidden, since an unreviewed default could
-        be the wrong slice of the data.
+        dimension id, give an ordered list of exact labels or option IDs to
+        match case-insensitively. If no verified selection is available,
+        the request fails safely instead of choosing an arbitrary series.
         """
         preferred_options = preferred_options or {}
         resolved_edition, resolved_version = self._resolve_edition_version(
             dataset_id, edition, version
         )
 
-        auto_filled_notes = []
-        try:
-            dims = self.get_dataset_dimensions(dataset_id, resolved_edition, resolved_version)
-        except requests.HTTPError:
-            dims = []  # if this itself fails, fall through and let the real request surface the error
+        selected_notes = []
+        dims = self.get_dataset_dimensions(dataset_id, resolved_edition, resolved_version)
+        supplied = {key.casefold(): value for key, value in dimension_filters.items()}
+        normalized_filters = {}
 
         for dim in dims:
-            dim_id = dim.get("id")
-            if not dim_id or dim_id in dimension_filters:
+            # The live API returns `name`; support `id` for older fixtures.
+            dim_id = dim.get("name") or dim.get("id")
+            if not dim_id:
                 continue
-            if dim_id == "time":
-                dimension_filters["time"] = "*"
+            if dim_id.casefold() in supplied:
+                normalized_filters[dim_id] = supplied[dim_id.casefold()]
                 continue
-            try:
-                options = self.get_dimension_options(
-                    dataset_id, resolved_edition, resolved_version, dim_id
-                )
-            except requests.HTTPError:
-                continue  # can't resolve this one -- let the observations call itself report the real error
-            if not options:
+            if dim_id.casefold() == "time":
+                normalized_filters[dim_id] = "*"
                 continue
 
+            options = self.get_dimension_options(
+                dataset_id, resolved_edition, resolved_version, dim_id
+            )
             chosen = None
             for wanted_label in preferred_options.get(dim_id, []):
+                wanted = wanted_label.strip().casefold()
                 for opt in options:
-                    label = (opt.get("label") or opt.get("id") or "")
-                    if label.strip().lower() == wanted_label.strip().lower():
+                    option_id = opt.get("option") or opt.get("id") or opt.get("node_id")
+                    label = str(opt.get("label") or option_id or "").strip().casefold()
+                    if label == wanted or str(option_id).casefold() == wanted:
                         chosen = opt
                         break
                 if chosen:
                     break
             if chosen is None:
-                chosen = options[0]
-                auto_filled_notes.append(
-                    f"{dim_id}='{chosen.get('label', chosen.get('id'))}' (no preference given -- "
-                    f"picked ONS's first listed option, not necessarily the headline one)"
+                raise ONSDataError(
+                    f"No verified option was configured for required ONS dimension "
+                    f"'{dim_id}' in dataset '{dataset_id}'. Refusing to select an "
+                    "arbitrary series."
                 )
-            else:
-                auto_filled_notes.append(
-                    f"{dim_id}='{chosen.get('label', chosen.get('id'))}' (matched preference)"
+            option_id = chosen.get("option") or chosen.get("id") or chosen.get("node_id")
+            if not option_id:
+                raise ONSDataError(
+                    f"ONS option for '{dim_id}' did not contain an option identifier."
                 )
-            dimension_filters[dim_id] = chosen.get("id")
+            normalized_filters[dim_id] = option_id
+            selected_notes.append(f"{dim_id}='{chosen.get('label', option_id)}'")
 
         obs_url = (
             f"{ONS_API_BASE}/datasets/{dataset_id}/editions/{resolved_edition}"
             f"/versions/{resolved_version}/observations"
         )
-        resp = requests.get(obs_url, params=dimension_filters, timeout=20)
-        resp.raise_for_status()
+        # Large wildcard series can be slow on the beta API. A 45-second
+        # read timeout avoids treating ordinary ONS latency as bad data.
+        resp = requests.get(obs_url, params=normalized_filters, timeout=45)
+        if not resp.ok:
+            raise _response_error(resp, f"observation request for '{dataset_id}'")
         payload = resp.json()
+        if not payload.get("observations"):
+            raise ONSDataError(
+                f"ONS returned zero observations for '{dataset_id}' using "
+                f"dimensions {normalized_filters}. URL: {resp.url}"
+            )
 
         notes = (
             "Raw ONS observation payload. Check 'observation level "
             "metadata' in the response for coefficients of variation "
             "before treating values as precise."
         )
-        if auto_filled_notes:
-            notes += " Auto-filled dimensions: " + "; ".join(auto_filled_notes)
+        if selected_notes:
+            notes += " Verified dimensions: " + "; ".join(selected_notes)
 
         return FetchResult(
             source_id=self.source.id,

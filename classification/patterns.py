@@ -63,13 +63,11 @@ def _employment_fetch_plan(claim_text: str) -> list[FetchPlanItem]:
                 "dataset_id": "labour-market",
                 "geography": "K02000001",
                 "time": "*",
-                "preferred_options": {
-                    "seasonaladjustment": ["Seasonally Adjusted"],
-                    "economicactivity": ["Unemployed"],
-                    "unitofmeasure": ["Rates"],
-                    "sex": ["All adults"],
-                    "agegroups": ["16+"],
-                },
+                "seasonaladjustment": "seasonal-adjustment",
+                "economicactivity": "unemployed",
+                "unitofmeasure": "rates",
+                "sex": "all-adults",
+                "agegroups": "16+",
             },
             purpose="outcome variable: unemployment/employment rate over time",
         ),
@@ -175,12 +173,17 @@ PATTERN_IMMIGRATION_CRIME = ClaimPattern(
 # one of these datasets' actual observation shape, since dimension names
 # can vary dataset-to-dataset and this hasn't been live-tested.
 
-def _single_ons_series_fetch_plan(dataset_id: str, purpose: str):
+def _single_ons_series_fetch_plan(dataset_id: str, purpose: str, **dimensions):
     def _plan(claim_text: str) -> list[FetchPlanItem]:
         return [
             FetchPlanItem(
                 source_id="ons",
-                params={"dataset_id": dataset_id, "geography": "K02000001", "time": "*"},
+                params={
+                    "dataset_id": dataset_id,
+                    "geography": "K02000001",
+                    "time": "*",
+                    **dimensions,
+                },
                 purpose=purpose,
             ),
         ]
@@ -200,7 +203,9 @@ PATTERN_INFLATION = ClaimPattern(
         "compare like-for-like base years across the claimed time window)",
         "which measure is meant (CPIH vs CPI vs RPI give materially different figures)",
     ],
-    fetch_plan=_single_ons_series_fetch_plan("cpih01", "outcome variable: CPIH inflation index over time"),
+    fetch_plan=_single_ons_series_fetch_plan(
+        "cpih01", "outcome variable: CPIH index over time", aggregate="CP00"
+    ),
 )
 
 PATTERN_GDP = ClaimPattern(
@@ -213,7 +218,9 @@ PATTERN_GDP = ClaimPattern(
         "revisions (early GDP estimates are routinely revised later — check which vintage the claim refers to)",
     ],
     fetch_plan=_single_ons_series_fetch_plan(
-        "gdp-to-four-decimal-places", "outcome variable: monthly GDP index over time"
+        "gdp-to-four-decimal-places",
+        "outcome variable: monthly whole-economy GDP index over time",
+        unofficialstandardindustrialclassification="A--T",
     ),
 )
 
@@ -276,6 +283,28 @@ PATTERN_POPULATION_TREND = ClaimPattern(
     ),
 )
 
+def _trade_fetch_plan(claim_text: str) -> list[FetchPlanItem]:
+    text = claim_text.lower()
+    # A deficit/surplus is exports minus imports, not either series alone.
+    if "deficit" in text or "surplus" in text:
+        return []
+    direction = "IM" if "import" in text and "export" not in text else "EX"
+    return [
+        FetchPlanItem(
+            source_id="ons",
+            params={
+                "dataset_id": "trade",
+                "geography": "K02000001",
+                "time": "*",
+                "countriesandterritories": "W1",
+                "standardindustrialtradeclassification": "T",
+                "direction": direction,
+            },
+            purpose="outcome variable: total UK goods imports/exports over time",
+        )
+    ]
+
+
 PATTERN_TRADE = ClaimPattern(
     name="trade_trend",
     trigger=lambda c: _contains_all(c, [["trade deficit", "trade surplus", "export", "import"]]),
@@ -283,7 +312,7 @@ PATTERN_TRADE = ClaimPattern(
     tests=[StatisticalTest.LINEAR_REGRESSION],
     confounds=["this dataset ('trade') covers goods by country/commodity specifically — "
                "confirm it matches the claim's scope before treating it as the overall UK trade balance"],
-    fetch_plan=_single_ons_series_fetch_plan("trade", "outcome variable: UK goods trade over time"),
+    fetch_plan=_trade_fetch_plan,
 )
 
 
