@@ -116,8 +116,7 @@ class VerdictEngine:
         if not significant:
             verdict = Verdict.UNPROVEN
             hedge = (
-                f"Based on {n_tests} statistical test(s) (Bonferroni-corrected "
-                f"significance threshold p < {corrected_alpha:.4f}), the data "
+                f"Based on {n_tests} statistical test(s), the data "
                 "does not show a statistically significant effect in either "
                 "direction. This claim is currently unproven, not disproven — "
                 "a null result with the available data and tests."
@@ -126,16 +125,16 @@ class VerdictEngine:
             verdict = Verdict.SUPPORTED
             hedge = (
                 f"The statistical tests suggest evidence consistent with this "
-                f"claim ({len(agreeing)} of {n_tests} test(s) significant at "
-                f"the Bonferroni-corrected threshold, in the direction the "
+                f"claim ({len(agreeing)} of {n_tests} test(s) statistically "
+                f"significant at the 5% level, in the direction the "
                 "claim asserts)."
             )
         elif opposing and not agreeing:
             verdict = Verdict.CONTRADICTED
             hedge = (
                 f"The statistical tests suggest evidence against this claim "
-                f"({len(opposing)} of {n_tests} test(s) significant at the "
-                "Bonferroni-corrected threshold, in the opposite direction "
+                f"({len(opposing)} of {n_tests} test(s) statistically "
+                "significant at the 5% level, in the opposite direction "
                 "to what the claim asserts)."
             )
         else:

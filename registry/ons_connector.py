@@ -73,7 +73,7 @@ def _parse_ons_time(label: str) -> pd.Timestamp:
     return pd.to_datetime(text, errors="coerce")
 
 
-def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series, pd.Series]:
+def parse_timeseries_points(fetch_result: FetchResult) -> pd.DataFrame:
     """
     Convert a raw ONS /observations payload into (time_index, values) series,
     ready to feed into stat_tests.run_linear_regression(x=time_index, y=values)
@@ -104,7 +104,7 @@ def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series,
         time_label = _time_value(obs.get("dimensions", {}))
         if time_label is None:
             continue
-        rows.append((time_label, value))
+        rows.append((time_label, _parse_ons_time(time_label), value))
 
     if len(rows) < 3:
         raise ValueError(
@@ -117,13 +117,17 @@ def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series,
     # x-axis — the actual calendar spacing doesn't matter for a trend
     # direction test, only the ordering does.
     def sort_key(row):
-        parsed = _parse_ons_time(row[0])
+        parsed = row[1]
         return (1, str(row[0])) if pd.isna(parsed) else (0, parsed)
 
     rows.sort(key=sort_key)
-    time_index = pd.Series(range(len(rows)))
-    values = pd.Series([v for _, v in rows])
-    return time_index, values
+    return pd.DataFrame(rows, columns=["label", "date", "value"])
+
+
+def parse_timeseries_observations(fetch_result: FetchResult) -> tuple[pd.Series, pd.Series]:
+    """Backward-compatible numeric adapter for a complete ONS series."""
+    points = parse_timeseries_points(fetch_result)
+    return pd.Series(range(len(points))), points["value"].reset_index(drop=True)
 
 
 class ONSConnector(Connector):

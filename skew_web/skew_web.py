@@ -51,7 +51,7 @@ class ChatState(rx.State):
 
 def chat_bubble(message: dict) -> rx.Component:
     return rx.box(
-        rx.text(message["content"]),
+        rx.markdown(message["content"]),
         background=rx.cond(message["role"] == "user", "#E8F0FE", "#F3F3F3"),
         padding="0.75em 1em",
         border_radius="12px",

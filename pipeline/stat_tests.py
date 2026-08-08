@@ -73,7 +73,14 @@ def run_linear_regression(
             "(from the classifier's confound list) were added as additional "
             "regressors before trusting this result alone.",
         ],
-        raw={"r_squared": float(model.rsquared), "slope": float(slope)},
+        raw={
+            "r_squared": float(model.rsquared),
+            "slope": float(slope),
+            "slope_confidence_interval_95": [
+                float(model.conf_int(alpha=0.05)[1][0]),
+                float(model.conf_int(alpha=0.05)[1][1]),
+            ],
+        },
     )
 
 

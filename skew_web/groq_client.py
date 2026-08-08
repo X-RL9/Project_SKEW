@@ -85,7 +85,16 @@ Rules:
 3. Never ask more than one clarifying question before attempting the claim — get straight to a real answer as fast as possible.
 4. If the tool returns an error (e.g. a live data fetch failed), say so honestly — don't paper over it or make up a number instead. ALWAYS include the exact raw error text the tool returned (in full, even if technical) so the user can share it for debugging, alongside your plain-English explanation.
 5. If the tool reports requires_human_review=True, tell the user this finding needs human sign-off before being treated as final.
-6. Keep responses conversational, direct, and concise — lead with the actual finding, not a preamble."""
+6. Keep responses conversational, direct, and concise — lead with the actual finding, not a preamble.
+7. For every successful statistical result, format the answer in Markdown using separate paragraphs in this exact order:
+   - First, a bold plain-English outcome stating supported, contradicted, or unproven; the measured direction and calculated change; and the exact period. Never repeat a percentage asserted by the user as though it was calculated. Use `observed_change` from `analysis_details`.
+   - Second, explain the named statistical method, observation count, estimated direction, hypothesis tested, 5% significance level, p-value, and 95% confidence interval when supplied. Do not mention Bonferroni in the public answer.
+   - Third, write `**Data source:**`, name the source, and on the next line include a Markdown link labelled `View the exact ONS data request` whose target is `source_url` exactly.
+   - Fourth, write `**Points to consider:**` and preserve the supplied confounds and caveats in accessible language.
+   - Finally, if `period_was_user_supplied` is false, state the default five-year period and ask: `Would you like me to test a different period or adjust the values for inflation?` If a period was supplied, offer to test another period.
+8. Always name every statistical test actually run. Never describe a multiple-testing adjustment as a statistical test.
+9. If `claimed_percentage_change` is present, compare it explicitly with `observed_change`. A direction-only result does not establish that the claimed magnitude is correct.
+"""
 
 
 def _run_tool(claim_text: str, expected_direction: str | None = None) -> dict:
@@ -114,6 +123,7 @@ def _run_tool(claim_text: str, expected_direction: str | None = None) -> dict:
                 }
                 for t in vr.test_results
             ],
+            "analysis_details": result.analysis_details,
         }
     except Exception as e:
         traceback.print_exc()
@@ -125,6 +135,85 @@ def _run_tool(claim_text: str, expected_direction: str | None = None) -> dict:
                 "to the user rather than guessing a verdict."
             ),
         }
+
+
+def _format_statistical_result(result: dict) -> str | None:
+    """Create the public result deterministically after the analysis runs."""
+    details = result.get("analysis_details")
+    tests = result.get("raw_test_results") or []
+    if not result.get("ok") or not details or not tests:
+        return None
+
+    change = details.get("observed_change")
+    change_unit = details.get("change_unit")
+    direction = "increased" if change is not None and change >= 0 else "decreased"
+    if change_unit == "percentage points":
+        change_text = f"{abs(change):.1f} percentage points"
+    else:
+        change_text = f"{abs(change):.1f}%"
+    series = details.get("series_name", "the measured series")
+    start = details.get("period_start")
+    end = details.get("period_end")
+
+    magnitude_matches = details.get("claimed_magnitude_matches_calculation")
+    if magnitude_matches is False and details.get("directional_verdict") == "supported":
+        claimed = details.get("claimed_percentage_change")
+        outcome = (
+            f"**The direction of the claim is supported, but its stated magnitude is not: "
+            f"{series} {direction} by {change_text} between {start} and {end}, "
+            f"rather than the claimed {claimed:.1f}%.**"
+        )
+    else:
+        verdict_phrase = {
+            "supported": "The evidence is consistent with the claim",
+            "contradicted": "The evidence is inconsistent with the claim",
+            "unproven": "The claim is not established by this analysis",
+            "mixed": "The evidence is mixed",
+        }.get(result.get("verdict"), "The analysis produced a result")
+        outcome = (
+            f"**{verdict_phrase}: {series} {direction} by {change_text} "
+            f"between {start} and {end}.**"
+        )
+
+    test = tests[0]
+    p_value = test.get("p_value")
+    p_text = f"{p_value:.4g}" if isinstance(p_value, (int, float)) else "not available"
+    ci = details.get("confidence_interval_95")
+    ci_text = ""
+    if ci:
+        unit = details.get("unit_of_measure") or "units"
+        if unit == "£million":
+            unit = "£ million"
+        ci_text = (
+            f" The 95% confidence interval for the monthly trend was "
+            f"{ci[0]:.3g} to {ci[1]:.3g} {unit} per month."
+        )
+    method = details.get("method")
+    n = details.get("n_observations")
+    effect = details.get("effect_direction")
+    methods = (
+        f"I calculated the change and fitted an {method} using {n} observations. "
+        f"The estimated trend was {effect}. I used a two-sided hypothesis test of "
+        f"whether the trend was zero at the 5% significance level (p = {p_text}).{ci_text}"
+    )
+
+    source = (
+        f"**Data source:** {details.get('source_name')}  \n"
+        f"[View the exact ONS data request]({details.get('source_url')})"
+    )
+    considerations = result.get("confounds_noted") or []
+    caveats = "\n" + "\n".join(f"- {item}" for item in considerations) if considerations else (
+        "Statistical significance does not by itself establish causation, and official data may be revised."
+    )
+    points = f"**Points to consider:** {caveats}"
+    if details.get("period_was_user_supplied"):
+        follow_up = "Would you like me to test a different period?"
+    else:
+        follow_up = (
+            f"I used the latest five-year period available, {start} to {end}. "
+            "Would you like me to test a different period or adjust the values for inflation?"
+        )
+    return "\n\n".join([outcome, methods, source, points, follow_up])
 
 
 def chat_turn(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -187,6 +276,10 @@ def chat_turn(messages: list[dict]) -> tuple[str, list[dict]]:
                 "tool_call_id": call["id"],
                 "content": json.dumps(result),
             })
+            formatted = _format_statistical_result(result)
+            if formatted and len(tool_calls) == 1:
+                full_messages.append({"role": "assistant", "content": formatted})
+                return formatted, full_messages[1:]
 
     return (
         "Something went wrong resolving this over several tool calls — try rephrasing your question.",

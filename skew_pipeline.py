@@ -38,10 +38,13 @@ Given (1) and (2), `run()` supports two modes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Callable, Optional
 
+import pandas as pd
+
 from classification import ClaimClassifier, ClaimType
-from pipeline.types import Direction, VerdictResult
+from pipeline.types import Direction, Verdict, VerdictResult
 from pipeline.stat_tests import TEST_REGISTRY
 from pipeline.verdict import VerdictEngine
 from registry import SourceRegistry
@@ -52,6 +55,26 @@ class PipelineRunResult:
     claim_text: str
     classification_matched_rule: Optional[str]
     verdict_result: VerdictResult
+    analysis_details: Optional[dict[str, Any]] = None
+
+
+def _claim_window(claim_text: str, latest: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp, bool]:
+    """Return start/end dates and whether the user supplied the period."""
+    years = [int(value) for value in re.findall(r"\b(?:19|20)\d{2}\b", claim_text)]
+    if len(years) >= 2:
+        return pd.Timestamp(year=min(years), month=1, day=1), pd.Timestamp(
+            year=max(years), month=12, day=31
+        ), True
+    if len(years) == 1:
+        return pd.Timestamp(year=years[0], month=1, day=1), latest, True
+    last_years = re.search(r"(?:last|past)\s+(\d+)\s+years?", claim_text, re.I)
+    if last_years:
+        return latest - pd.DateOffset(years=int(last_years.group(1))), latest, True
+    return latest - pd.DateOffset(years=5), latest, False
+
+
+def _period_label(value: pd.Timestamp) -> str:
+    return value.strftime("%B %Y")
 
 
 class SkewPipeline:
@@ -85,6 +108,7 @@ class SkewPipeline:
             usable by the stat tests — flagged in the result's caveats.
         """
         classification = self.classifier.classify(claim_text)
+        analysis_details = None
 
         # Opinions and unclassifiable claims short-circuit before any
         # fetching or testing — there's nothing to test.
@@ -96,7 +120,6 @@ class SkewPipeline:
                 requires_human_review=False,
             )
             verdict.verdict = verdict.verdict  # INSUFFICIENT_DATA by default from empty tests
-            from pipeline.types import Verdict
             verdict.verdict = Verdict.NOT_A_FACTUAL_CLAIM
             verdict.hedge_statement = (
                 "This is a statement of opinion or value judgment, not a "
@@ -161,9 +184,77 @@ class SkewPipeline:
                     # ons_connector.parse_timeseries_observations), so wire
                     # this automatically rather than requiring the caller
                     # to supply a custom adapter for every trend pattern.
-                    from registry.ons_connector import parse_timeseries_observations
-                    time_index, values = parse_timeseries_observations(fetch_result)
+                    from registry.ons_connector import parse_timeseries_points
+                    points = parse_timeseries_points(fetch_result).dropna(subset=["date"])
+
+                    # CPIH is an index level. Convert it to the economically
+                    # meaningful 12-month inflation rate before testing an
+                    # inflation claim.
+                    is_inflation = classification.matched_rule == "inflation_trend"
+                    if is_inflation:
+                        points = points.copy()
+                        points["value"] = points["value"].pct_change(12) * 100
+                        points = points.dropna(subset=["value"])
+
+                    latest = points["date"].max()
+                    start, end, user_supplied_period = _claim_window(claim_text, latest)
+                    selected = points[
+                        (points["date"] >= start) & (points["date"] <= end)
+                    ].copy()
+                    if len(selected) < 3:
+                        raise ValueError(
+                            f"Only {len(selected)} observations are available between "
+                            f"{_period_label(start)} and {_period_label(end)}."
+                        )
+
+                    time_index = pd.Series(range(len(selected)))
+                    values = selected["value"].reset_index(drop=True)
                     fetched["linear_regression"] = {"x": time_index, "y": values}
+
+                    first_value = float(values.iloc[0])
+                    last_value = float(values.iloc[-1])
+                    if is_inflation:
+                        change = last_value - first_value
+                        change_unit = "percentage points"
+                    else:
+                        change = ((last_value / first_value) - 1) * 100 if first_value else None
+                        change_unit = "percent"
+                    claimed = re.search(r"(-?\d+(?:\.\d+)?)\s*%", claim_text)
+                    if is_inflation:
+                        series_name = "the 12-month UK CPIH inflation rate"
+                    elif classification.matched_rule == "gdp_growth_trend":
+                        series_name = "UK monthly GDP"
+                    elif classification.matched_rule == "trade_trend":
+                        series_name = (
+                            "UK goods imports" if item.params.get("direction") == "IM"
+                            else "UK goods exports"
+                        )
+                    else:
+                        series_name = item.purpose.replace("outcome variable: ", "")
+                    analysis_details = {
+                        "method": "ordinary least-squares linear time-trend regression",
+                        "hypothesis_test": "two-sided test of whether the regression trend is zero",
+                        "significance_level": "5%",
+                        "period_start": _period_label(selected["date"].iloc[0]),
+                        "period_end": _period_label(selected["date"].iloc[-1]),
+                        "period_was_user_supplied": user_supplied_period,
+                        "used_default_five_year_period": not user_supplied_period,
+                        "n_observations": len(selected),
+                        "first_value": first_value,
+                        "last_value": last_value,
+                        "observed_change": change,
+                        "change_unit": change_unit,
+                        "claimed_percentage_change": float(claimed.group(1)) if claimed else None,
+                        "measure": "12-month CPIH inflation rate" if is_inflation else item.purpose,
+                        "series_name": series_name,
+                        "unit_of_measure": (
+                            "Percent" if is_inflation else str(
+                                fetch_result.data.get("unit_of_measure") or ""
+                            ).replace("Â£", "£")
+                        ),
+                        "source_name": "Office for National Statistics",
+                        "source_url": fetch_result.provenance_url,
+                    }
                 # otherwise fetch_result is retrieved but not automatically
                 # wired into a test — see class docstring
             test_data = fetched
@@ -197,8 +288,38 @@ class SkewPipeline:
             note = "Tests recommended but not run: " + "; ".join(skipped_tests)
             verdict.hedge_statement += f" [{note}]"
 
+        if analysis_details and test_results:
+            primary = test_results[0]
+            analysis_details.update({
+                "p_value": primary.p_value,
+                "effect_direction": primary.effect_direction,
+                "slope": primary.effect_size,
+                "confidence_interval_95": (
+                    primary.raw or {}
+                ).get("slope_confidence_interval_95"),
+                "r_squared": (primary.raw or {}).get("r_squared"),
+            })
+            claimed_change = analysis_details.get("claimed_percentage_change")
+            observed_change = analysis_details.get("observed_change")
+            if claimed_change is not None and observed_change is not None:
+                difference = observed_change - claimed_change
+                magnitude_matches = abs(difference) <= 0.5
+                analysis_details.update({
+                    "magnitude_difference_percentage_points": difference,
+                    "claimed_magnitude_matches_calculation": magnitude_matches,
+                    "directional_verdict": verdict.verdict.value,
+                })
+                if not magnitude_matches:
+                    verdict.verdict = Verdict.MIXED
+                    verdict.hedge_statement = (
+                        "The direction of the claim is supported, but its stated "
+                        f"magnitude is not: the data shows {observed_change:.1f}% "
+                        f"rather than {claimed_change:.1f}% over the tested period."
+                    )
+
         return PipelineRunResult(
             claim_text=claim_text,
             classification_matched_rule=classification.matched_rule,
             verdict_result=verdict,
+            analysis_details=analysis_details,
         )
